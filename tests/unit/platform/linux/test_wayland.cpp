@@ -6,16 +6,19 @@
   // standard includes
   #include <array>
   #include <cerrno>
+  #include <cstdlib>
 
   // system includes
   #include <drm_fourcc.h>
   #include <fcntl.h>
+  #include <sys/socket.h>
   #include <unistd.h>
 
   // test includes
   #include "../../../tests_common.h"
 
   // local includes
+  #include <src/config.h>
   #include <src/platform/linux/wayland.h>
 
 namespace {
@@ -167,5 +170,379 @@ TEST(WaylandCaptureTest, ClosesExportedPlanesAfterLaterPlaneFails) {
   EXPECT_EQ(fd_status, -1);
   EXPECT_EQ(fd_error, EBADF);
   EXPECT_EQ(frame.sd.fds[0], -1);
+}
+
+namespace {
+  /**
+   * @brief Wayland client connected to a socket peer that records requests without a compositor.
+   */
+  class screencopy_wire_t {
+  public:
+    /**
+     * @brief Connect the recording peer and bind a version-three screencopy manager.
+     */
+    screencopy_wire_t() {
+      int sockets[2];
+      if (socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, sockets) != 0) {
+        return;
+      }
+      peer = sockets[1];
+      display.reset(wl_display_connect_to_fd(sockets[0]));
+      if (!display) {
+        return;
+      }
+      auto registry = wl_display_get_registry(display.get());
+      manager = static_cast<zwlr_screencopy_manager_v1 *>(wl_registry_bind(registry, 1, &zwlr_screencopy_manager_v1_interface, 3));
+      output = static_cast<wl_output *>(wl_registry_bind(registry, 2, &wl_output_interface, 2));
+      dmabuf = static_cast<zwp_linux_dmabuf_v1 *>(wl_registry_bind(registry, 3, &zwp_linux_dmabuf_v1_interface, 3));
+      wl_registry_destroy(registry);
+      requests();
+    }
+
+    /**
+     * @brief Release the recording connection.
+     */
+    ~screencopy_wire_t() {
+      if (manager) {
+        zwlr_screencopy_manager_v1_destroy(manager);
+      }
+      if (dmabuf) {
+        zwp_linux_dmabuf_v1_destroy(dmabuf);
+      }
+      if (output) {
+        wl_output_destroy(output);
+      }
+      if (peer >= 0) {
+        close(peer);
+      }
+    }
+
+    /**
+     * @brief Return object IDs and opcodes sent since the previous read.
+     * @return Recorded requests in wire order.
+     */
+    std::vector<std::pair<std::uint32_t, std::uint16_t>> requests() {
+      wl_display_flush(display.get());
+      std::array<std::uint32_t, 256> wire {};
+      const auto bytes = recv(peer, wire.data(), sizeof(wire), MSG_DONTWAIT);
+      std::vector<std::pair<std::uint32_t, std::uint16_t>> result;
+      for (int offset = 0; offset < bytes / 4;) {
+        const auto header = wire[offset + 1];
+        result.emplace_back(wire[offset], header & 0xffff);
+        if (wire[offset] == wl_proxy_get_id(reinterpret_cast<wl_proxy *>(manager)) && (header & 0xffff) == ZWLR_SCREENCOPY_MANAGER_V1_CAPTURE_OUTPUT) {
+          frame_id = wire[offset + 2];
+        }
+        if (wire[offset] == wl_proxy_get_id(reinterpret_cast<wl_proxy *>(dmabuf)) && (header & 0xffff) == ZWP_LINUX_DMABUF_V1_CREATE_PARAMS) {
+          params_ids.push_back(wire[offset + 2]);
+        }
+        offset += (header >> 16) / 4;
+      }
+      return result;
+    }
+
+    /**
+     * @brief Deliver a compositor failure event to the latest capture request.
+     */
+    void fail_frame() {
+      const std::array<std::uint32_t, 2> event {frame_id, (8u << 16) | 3u};
+      ASSERT_EQ(send(peer, event.data(), sizeof(event), 0), sizeof(event));
+      ASSERT_GE(wl_display_dispatch(display.get()), 0);
+    }
+
+    /**
+     * @brief Deliver a compositor ready event to the latest capture request.
+     */
+    void ready_frame() {
+      const std::array<std::uint32_t, 5> event {frame_id, (20u << 16) | 2u, 0, 1, 0};
+      ASSERT_EQ(send(peer, event.data(), sizeof(event), 0), sizeof(event));
+      ASSERT_GE(wl_display_dispatch(display.get()), 0);
+    }
+
+    /**
+     * @brief Advertise a DMA-BUF and finish describing the latest frame.
+     * @param fourcc DRM format code to advertise.
+     */
+    void describe_frame(std::uint32_t fourcc = DRM_FORMAT_XRGB8888) {
+      const std::array<std::uint32_t, 7> event {frame_id, (20u << 16) | 5u, fourcc, 2752, 2064, frame_id, (8u << 16) | 6u};
+      ASSERT_EQ(send(peer, event.data(), sizeof(event), 0), sizeof(event));
+      ASSERT_GE(wl_display_dispatch(display.get()), 0);
+    }
+
+    /**
+     * @brief Advertise only a shared-memory buffer and finish describing the latest frame.
+     */
+    void describe_shm_frame() {
+      const std::array<std::uint32_t, 8> event {frame_id, (24u << 16) | 0u, DRM_FORMAT_XRGB8888, 2752, 2064, 2752 * 4, frame_id, (8u << 16) | 6u};
+      ASSERT_EQ(send(peer, event.data(), sizeof(event), 0), sizeof(event));
+      ASSERT_GE(wl_display_dispatch(display.get()), 0);
+    }
+
+    /**
+     * @brief Finish describing the latest frame without advertising any buffer type.
+     */
+    void describe_empty_frame() {
+      const std::array<std::uint32_t, 2> event {frame_id, (8u << 16) | 6u};
+      ASSERT_EQ(send(peer, event.data(), sizeof(event), 0), sizeof(event));
+      ASSERT_GE(wl_display_dispatch(display.get()), 0);
+    }
+
+    /**
+     * @brief Deliver a buffer creation failure to the latest parameter request.
+     */
+    void fail_buffer() {
+      const std::array<std::uint32_t, 2> event {params_ids.back(), (8u << 16) | 1u};
+      ASSERT_EQ(send(peer, event.data(), sizeof(event), 0), sizeof(event));
+      ASSERT_GE(wl_display_dispatch(display.get()), 0);
+    }
+
+    /**
+     * @brief Complete asynchronous buffer creation for the latest parameter request.
+     */
+    void create_buffer() {
+      const std::array<std::uint32_t, 3> event {params_ids.back(), 12u << 16, 0xff000000u};
+      ASSERT_EQ(send(peer, event.data(), sizeof(event), 0), sizeof(event));
+      ASSERT_GE(wl_display_dispatch(display.get()), 0);
+    }
+
+    zwp_linux_dmabuf_v1 *dmabuf {nullptr};  ///< DMA-BUF interface used by allocation tests.
+    std::vector<std::uint32_t> params_ids;  ///< Requested asynchronous buffer parameter IDs.
+    std::uint32_t frame_id {};  ///< Most recently requested screencopy frame ID.
+    wl::display_internal_t display;  ///< Client connection used by the capture object.
+    zwlr_screencopy_manager_v1 *manager {nullptr};  ///< Bound screencopy manager.
+    wl_output *output {nullptr};  ///< Output proxy used in capture requests.
+    int peer {-1};  ///< Peer socket that receives client requests.
+  };
+}  // namespace
+
+TEST(WaylandCaptureTest, KeepsOneRequestAcrossTimeoutRetries) {
+  screencopy_wire_t wire;
+  ASSERT_TRUE(wire.display);
+  wl::dmabuf_t capture;
+
+  capture.listen(wire.manager, nullptr, nullptr, wire.output);
+  auto first = wire.requests();
+  ASSERT_EQ(first.size(), 1);
+  EXPECT_EQ(first.front().first, wl_proxy_get_id(reinterpret_cast<wl_proxy *>(wire.manager)));
+  EXPECT_EQ(first.front().second, ZWLR_SCREENCOPY_MANAGER_V1_CAPTURE_OUTPUT);
+
+  // No terminal callback has arrived, as after a snapshot timeout.
+  capture.listen(wire.manager, nullptr, nullptr, wire.output);
+  EXPECT_TRUE(wire.requests().empty());
+  EXPECT_EQ(capture.status, wl::dmabuf_t::WAITING);
+}
+
+TEST(WaylandCaptureTest, CancelsPendingRequestOnDestruction) {
+  screencopy_wire_t wire;
+  ASSERT_TRUE(wire.display);
+  {
+    wl::dmabuf_t capture;
+    capture.listen(wire.manager, nullptr, nullptr, wire.output);
+    ASSERT_EQ(wire.requests().size(), 1);
+  }
+
+  const auto requests = wire.requests();
+  ASSERT_EQ(requests.size(), 1);
+  EXPECT_EQ(requests.front().second, ZWLR_SCREENCOPY_FRAME_V1_DESTROY);
+}
+
+TEST(WaylandCaptureTest, StartsNewRequestAfterCompositorFailure) {
+  screencopy_wire_t wire;
+  ASSERT_TRUE(wire.display);
+  wl::dmabuf_t capture;
+  capture.listen(wire.manager, nullptr, nullptr, wire.output);
+  ASSERT_EQ(wire.requests().size(), 1);
+
+  wire.fail_frame();
+  EXPECT_EQ(capture.status, wl::dmabuf_t::REINIT);
+  ASSERT_EQ(wire.requests().size(), 1);
+
+  capture.listen(wire.manager, nullptr, nullptr, wire.output);
+  const auto requests = wire.requests();
+  ASSERT_EQ(requests.size(), 1);
+  EXPECT_EQ(requests.front().second, ZWLR_SCREENCOPY_MANAGER_V1_CAPTURE_OUTPUT);
+}
+
+TEST(WaylandCaptureTest, StartsNewRequestAfterReadyFrame) {
+  screencopy_wire_t wire;
+  ASSERT_TRUE(wire.display);
+  wl::dmabuf_t capture;
+  capture.listen(wire.manager, nullptr, nullptr, wire.output);
+  ASSERT_EQ(wire.requests().size(), 1);
+
+  wire.ready_frame();
+  EXPECT_EQ(capture.status, wl::dmabuf_t::READY);
+  ASSERT_EQ(wire.requests().size(), 1);
+
+  capture.listen(wire.manager, nullptr, nullptr, wire.output);
+  ASSERT_EQ(wire.requests().size(), 1);
+}
+
+TEST(WaylandCaptureTest, DoesNotCancelCompletedRequestAgain) {
+  screencopy_wire_t wire;
+  ASSERT_TRUE(wire.display);
+  {
+    wl::dmabuf_t capture;
+    capture.listen(wire.manager, nullptr, nullptr, wire.output);
+    ASSERT_EQ(wire.requests().size(), 1);
+    wire.fail_frame();
+    ASSERT_EQ(wire.requests().size(), 1);
+  }
+  EXPECT_TRUE(wire.requests().empty());
+}
+
+TEST(WaylandCaptureTest, CancelsRequestWhenNoBufferTypeIsAdvertised) {
+  screencopy_wire_t wire;
+  ASSERT_TRUE(wire.display);
+  wl::dmabuf_t capture;
+  capture.listen(wire.manager, wire.dmabuf, nullptr, wire.output);
+  ASSERT_EQ(wire.requests().size(), 1);
+
+  wire.describe_empty_frame();
+  EXPECT_EQ(capture.status, wl::dmabuf_t::REINIT);
+  const auto requests = wire.requests();
+  ASSERT_EQ(requests.size(), 1);
+  EXPECT_EQ(requests.front().first, wire.frame_id);
+  EXPECT_EQ(requests.front().second, ZWLR_SCREENCOPY_FRAME_V1_DESTROY);
+}
+
+TEST(WaylandCaptureTest, CancelsRequestWhenOnlySharedMemoryIsAdvertised) {
+  screencopy_wire_t wire;
+  ASSERT_TRUE(wire.display);
+  wl::dmabuf_t capture;
+  capture.listen(wire.manager, wire.dmabuf, nullptr, wire.output);
+  ASSERT_EQ(wire.requests().size(), 1);
+
+  wire.describe_shm_frame();
+  EXPECT_EQ(capture.status, wl::dmabuf_t::REINIT);
+  const auto requests = wire.requests();
+  ASSERT_EQ(requests.size(), 1);
+  EXPECT_EQ(requests.front().second, ZWLR_SCREENCOPY_FRAME_V1_DESTROY);
+}
+
+TEST(WaylandCaptureTest, CancelsRequestWhenRenderNodeCannotBeOpened) {
+  auto previous_adapter = std::exchange(config::video.adapter_name, "/nonexistent/render-node");
+  auto restore_adapter = util::fail_guard([&] {
+    config::video.adapter_name = previous_adapter;
+  });
+  screencopy_wire_t wire;
+  ASSERT_TRUE(wire.display);
+  wl::dmabuf_t capture;
+  capture.listen(wire.manager, wire.dmabuf, nullptr, wire.output);
+  ASSERT_EQ(wire.requests().size(), 1);
+
+  wire.describe_frame();
+  EXPECT_EQ(capture.status, wl::dmabuf_t::REINIT);
+  const auto requests = wire.requests();
+  ASSERT_EQ(requests.size(), 1);
+  EXPECT_EQ(requests.front().second, ZWLR_SCREENCOPY_FRAME_V1_DESTROY);
+}
+
+TEST(WaylandCaptureTest, ReleasesRequestAndBufferAfterSuccessfulCapture) {
+  const char *render_node = std::getenv("SUNSHINE_TEST_WAYLAND_RENDER_NODE");
+  if (!render_node) {
+    GTEST_SKIP() << "Set SUNSHINE_TEST_WAYLAND_RENDER_NODE to opt in to real GBM allocation";
+  }
+  auto previous_adapter = std::exchange(config::video.adapter_name, render_node);
+  auto restore_adapter = util::fail_guard([&] {
+    config::video.adapter_name = previous_adapter;
+  });
+  screencopy_wire_t wire;
+  ASSERT_TRUE(wire.display);
+  {
+    wl::dmabuf_t capture;
+    const std::map<std::uint32_t, std::vector<std::uint64_t>> modifiers {{DRM_FORMAT_XRGB8888, {DRM_FORMAT_MOD_LINEAR}}};
+    capture.listen(wire.manager, wire.dmabuf, &modifiers, wire.output);
+    ASSERT_EQ(wire.requests().size(), 1);
+    for (int retry = 0; retry < 4; ++retry) {
+      capture.listen(wire.manager, wire.dmabuf, &modifiers, wire.output);
+      EXPECT_TRUE(wire.requests().empty());
+    }
+    wire.describe_frame();
+    wire.requests();
+    ASSERT_EQ(wire.params_ids.size(), 1);
+    wire.create_buffer();
+    wire.requests();
+    wire.ready_frame();
+    EXPECT_EQ(capture.status, wl::dmabuf_t::READY);
+    const auto terminal = wire.requests();
+    EXPECT_EQ(std::count_if(terminal.begin(), terminal.end(), [](const auto &request) {
+                return request.first == 0xff000000u;
+              }),
+              1);
+  }
+}
+
+TEST(WaylandCaptureTest, CancelsBufferParamsWhenFrameFails) {
+  const char *render_node = std::getenv("SUNSHINE_TEST_WAYLAND_RENDER_NODE");
+  if (!render_node) {
+    GTEST_SKIP() << "Set SUNSHINE_TEST_WAYLAND_RENDER_NODE to opt in to real GBM allocation";
+  }
+  auto previous_adapter = std::exchange(config::video.adapter_name, render_node);
+  auto restore_adapter = util::fail_guard([&] {
+    config::video.adapter_name = previous_adapter;
+  });
+  screencopy_wire_t wire;
+  ASSERT_TRUE(wire.display);
+  wl::dmabuf_t capture;
+  capture.listen(wire.manager, wire.dmabuf, nullptr, wire.output);
+  ASSERT_EQ(wire.requests().size(), 1);
+  wire.describe_frame();
+  wire.requests();
+  ASSERT_EQ(wire.params_ids.size(), 1);
+
+  wire.fail_frame();
+  EXPECT_EQ(capture.status, wl::dmabuf_t::REINIT);
+  const auto requests = wire.requests();
+  ASSERT_EQ(requests.size(), 2);
+  EXPECT_EQ(requests[0].first, wire.params_ids.front());
+  EXPECT_EQ(requests[1].first, wire.frame_id);
+}
+
+TEST(WaylandCaptureTest, CancelsRequestWhenBufferAllocationFails) {
+  const char *render_node = std::getenv("SUNSHINE_TEST_WAYLAND_RENDER_NODE");
+  if (!render_node) {
+    GTEST_SKIP() << "Set SUNSHINE_TEST_WAYLAND_RENDER_NODE to opt in to real GBM allocation";
+  }
+  auto previous_adapter = std::exchange(config::video.adapter_name, render_node);
+  auto restore_adapter = util::fail_guard([&] {
+    config::video.adapter_name = previous_adapter;
+  });
+  screencopy_wire_t wire;
+  ASSERT_TRUE(wire.display);
+  wl::dmabuf_t capture;
+  capture.listen(wire.manager, wire.dmabuf, nullptr, wire.output);
+  ASSERT_EQ(wire.requests().size(), 1);
+
+  wire.describe_frame(DRM_FORMAT_INVALID);
+  EXPECT_EQ(capture.status, wl::dmabuf_t::REINIT);
+  const auto requests = wire.requests();
+  ASSERT_EQ(requests.size(), 1);
+  EXPECT_EQ(requests.front().second, ZWLR_SCREENCOPY_FRAME_V1_DESTROY);
+}
+
+TEST(WaylandCaptureTest, CancelsRequestWhenBufferCreationFails) {
+  const char *render_node = std::getenv("SUNSHINE_TEST_WAYLAND_RENDER_NODE");
+  if (!render_node) {
+    GTEST_SKIP() << "Set SUNSHINE_TEST_WAYLAND_RENDER_NODE to opt in to real GBM allocation";
+  }
+  auto previous_adapter = std::exchange(config::video.adapter_name, render_node);
+  auto restore_adapter = util::fail_guard([&] {
+    config::video.adapter_name = previous_adapter;
+  });
+  screencopy_wire_t wire;
+  ASSERT_TRUE(wire.display);
+  wl::dmabuf_t capture;
+  capture.listen(wire.manager, wire.dmabuf, nullptr, wire.output);
+  ASSERT_EQ(wire.requests().size(), 1);
+  wire.describe_frame();
+  wire.requests();
+  ASSERT_EQ(wire.params_ids.size(), 1);
+
+  wire.fail_buffer();
+  EXPECT_EQ(capture.status, wl::dmabuf_t::REINIT);
+  const auto requests = wire.requests();
+  ASSERT_EQ(requests.size(), 2);
+  EXPECT_EQ(requests[0].first, wire.params_ids.front());
+  EXPECT_EQ(requests[1].first, wire.frame_id);
 }
 #endif
