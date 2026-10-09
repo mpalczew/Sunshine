@@ -114,7 +114,8 @@ namespace wl {
     dmabuf_t &operator=(dmabuf_t &&) = delete;
 
     /**
-     * @brief Start a screencopy request and attach the DMA-BUF listener callbacks.
+     * @brief Start a screencopy request, or continue the pending request after a timeout.
+     * @note Only one request may own the capture buffers at a time.
      *
      * @param screencopy_manager Compositor screencopy manager used to request frames.
      * @param dmabuf_interface Compositor DMA-BUF interface used to allocate buffers.
@@ -127,7 +128,7 @@ namespace wl {
     /**
      * @brief Store the Wayland buffer created for a DMA-BUF parameter request.
      *
-     * @param data Pointer to the `dmabuf_t` instance associated with the callback.
+     * @param data Screencopy request whose user data identifies the capture instance.
      * @param params DMA-BUF parameter object that completed buffer creation.
      * @param wl_buffer Wayland buffer created from the DMA-BUF planes.
      */
@@ -135,7 +136,7 @@ namespace wl {
     /**
      * @brief Mark DMA-BUF buffer creation as failed.
      *
-     * @param data Pointer to the `dmabuf_t` instance associated with the callback.
+     * @param data Screencopy request whose user data identifies the capture instance.
      * @param params DMA-BUF parameter object that failed buffer creation.
      */
     static void buffer_params_failed(void *data, struct zwp_linux_buffer_params_v1 *params);
@@ -215,6 +216,9 @@ namespace wl {
     bool init_gbm();
     void cleanup_gbm();
     void create_and_copy_dmabuf(zwlr_screencopy_frame_v1 *frame);
+
+    std::unique_ptr<zwlr_screencopy_frame_v1, decltype(&zwlr_screencopy_frame_v1_destroy)> capture_frame {nullptr, zwlr_screencopy_frame_v1_destroy};  ///< Outstanding screencopy request, including across snapshot timeouts.
+    std::unique_ptr<zwp_linux_buffer_params_v1, decltype(&zwp_linux_buffer_params_v1_destroy)> buffer_params {nullptr, zwp_linux_buffer_params_v1_destroy};  ///< Pending asynchronous DMA-BUF buffer creation.
 
     zwp_linux_dmabuf_v1 *dmabuf_interface {nullptr};
     const std::map<std::uint32_t, std::vector<std::uint64_t>> *supported_modifiers {nullptr};

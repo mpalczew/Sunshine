@@ -347,6 +347,10 @@ namespace wl {
     bool blend_cursor,
     const std::map<std::uint32_t, std::vector<std::uint64_t>> *encoder_modifiers
   ) {
+    if (status == WAITING) {
+      return;
+    }
+
     this->dmabuf_interface = dmabuf_interface;
     this->supported_modifiers = supported_modifiers;
     this->encoder_modifiers = encoder_modifiers;
@@ -355,11 +359,12 @@ namespace wl {
     dmabuf_info.supported = false;
 
     // Create new frame
-    auto frame = zwlr_screencopy_manager_v1_capture_output(
+    capture_frame.reset(zwlr_screencopy_manager_v1_capture_output(
       screencopy_manager,
       blend_cursor ? 1 : 0,
       output
-    );
+    ));
+    auto frame = capture_frame.get();
 
     // Store frame data pointer for callbacks
     zwlr_screencopy_frame_v1_set_user_data(frame, this);
@@ -371,6 +376,8 @@ namespace wl {
   }
 
   dmabuf_t::~dmabuf_t() {
+    buffer_params.reset();
+    capture_frame.reset();
     cleanup_gbm();
 
     for (auto &frame : frames) {
@@ -447,7 +454,7 @@ namespace wl {
   void dmabuf_t::create_and_copy_dmabuf(zwlr_screencopy_frame_v1 *frame) {
     if (!init_gbm()) {
       BOOST_LOG(error) << "Failed to initialize GBM"sv;
-      zwlr_screencopy_frame_v1_destroy(frame);
+      capture_frame.reset();
       status = REINIT;
       return;
     }
@@ -467,7 +474,7 @@ namespace wl {
 
     if (!current_bo) {
       BOOST_LOG(error) << "Failed to create GBM buffer"sv;
-      zwlr_screencopy_frame_v1_destroy(frame);
+      capture_frame.reset();
       status = REINIT;
       return;
     }
@@ -478,13 +485,14 @@ namespace wl {
     if (!plane_count) {
       gbm_bo_destroy(current_bo);
       current_bo = nullptr;
-      zwlr_screencopy_frame_v1_destroy(frame);
+      capture_frame.reset();
       status = REINIT;
       return;
     }
 
     // Create linux-dmabuf buffer
-    auto params = zwp_linux_dmabuf_v1_create_params(dmabuf_interface);
+    buffer_params.reset(zwp_linux_dmabuf_v1_create_params(dmabuf_interface));
+    auto params = buffer_params.get();
     for (std::uint32_t plane = 0; plane < *plane_count; ++plane) {
       zwp_linux_buffer_params_v1_add(
         params,
@@ -520,11 +528,11 @@ namespace wl {
     } else if (shm_info.supported) {
       // SHM fallback would go here
       BOOST_LOG(warning) << "[wayland] SHM capture not implemented"sv;
-      zwlr_screencopy_frame_v1_destroy(frame);
+      capture_frame.reset();
       status = REINIT;
     } else {
       BOOST_LOG(error) << "[wayland] No supported buffer types"sv;
-      zwlr_screencopy_frame_v1_destroy(frame);
+      capture_frame.reset();
       status = REINIT;
     }
   }
@@ -542,7 +550,7 @@ namespace wl {
     self->current_wl_buffer = buffer;
 
     // Start the actual copy
-    zwp_linux_buffer_params_v1_destroy(params);
+    self->buffer_params.reset();
     zwlr_screencopy_frame_v1_copy(frame, buffer);
   }
 
@@ -558,8 +566,8 @@ namespace wl {
     self->cleanup_gbm();
     self->get_next_frame()->destroy();
 
-    zwp_linux_buffer_params_v1_destroy(params);
-    zwlr_screencopy_frame_v1_destroy(frame);
+    self->buffer_params.reset();
+    self->capture_frame.reset();
     self->status = REINIT;
   }
 
@@ -588,7 +596,7 @@ namespace wl {
 
     cleanup_gbm();
 
-    zwlr_screencopy_frame_v1_destroy(frame);
+    capture_frame.reset();
     status = READY;
   }
 
@@ -597,11 +605,12 @@ namespace wl {
     BOOST_LOG(error) << "[wayland] Frame capture failed"sv;
 
     // Clean up resources
+    buffer_params.reset();
     cleanup_gbm();
     auto next_frame = get_next_frame();
     next_frame->destroy();
 
-    zwlr_screencopy_frame_v1_destroy(frame);
+    capture_frame.reset();
     status = REINIT;
   }
 
